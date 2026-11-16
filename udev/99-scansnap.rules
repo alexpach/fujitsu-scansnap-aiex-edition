@@ -1,0 +1,9 @@
+# Fujitsu ScanSnap iX500 (Evernote Edition, 04c5:13f3).
+# Give the device a stable systemd unit name (dev-scansnap.device) and start the
+# user's scan-button service whenever it's plugged in / switched on.
+# Must match every action except remove: USB devices get "add" then "bind",
+# and a rule that skips "bind" loses the systemd tag (service starts, then stops).
+ACTION!="remove", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", \
+  ATTR{idVendor}=="04c5", ATTR{idProduct}=="13f3", \
+  TAG+="systemd", ENV{SYSTEMD_ALIAS}+="/dev/scansnap", \
+  ENV{SYSTEMD_USER_WANTS}+="scan-button.service"

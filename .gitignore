@@ -1,0 +1,4 @@
+build/
+card-test/
+docs/*.pdf
+__pycache__/

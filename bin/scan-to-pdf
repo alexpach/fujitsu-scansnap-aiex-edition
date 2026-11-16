@@ -1,0 +1,998 @@
+#!/usr/bin/python3
+"""Scan the ADF stack into searchable PDFs, split into documents and named after their contents.
+
+Pipeline (per scan):
+ 1. scanimage: duplex, crop, deskew, stop on double feed  -> one TIFF per side
+ 2. per side: size + blank test (inner area only, so edge shadows don't count)
+ 3. per side: orientation (tesseract OSD; brute force for cards / low confidence)
+ 4. per side: rotate, JPEG, tesseract -> one-page PDF with text layer + text
+ 5. split into documents at sheet boundaries (see split_documents), cards one per file,
+    a fully blank sheet works as a manual separator
+ 6. join pages (pdfunite), name from contents, save, notify (click to open)
+
+Settings come from the environment (see README / ~/.config/scan-button.env).
+Usage:
+  scan-to-pdf                       scan into the queue, start the worker, return (what the button runs)
+  scan-to-pdf --worker              process queued scans, oldest first (scan-process.service)
+  scan-to-pdf --from-dir DIR        process existing p0001.tif/jpg… files directly (testing)
+  scan-to-pdf --dry-run --from-dir DIR   only print orientation/split decisions and names
+"""
+import datetime as dt
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+
+os.environ["PATH"] = f"{Path.home()}/.local/bin:" + os.environ.get("PATH", "/usr/bin")
+os.environ["OMP_THREAD_LIMIT"] = "1"   # one thread per tesseract; we run pages in parallel
+
+ENV = os.environ.get
+DEVICE = ENV("SCAN_DEVICE", "fujitsu")
+OUTDIR = Path(os.path.expanduser(ENV("SCAN_OUTDIR", "~/Notes/Scans")))
+MODE = ENV("SCAN_MODE", "Color")
+RES = int(ENV("SCAN_RESOLUTION", "300"))
+SOURCE = ENV("SCAN_SOURCE", "ADF Duplex")
+BLANK_PCT = float(ENV("SCAN_BLANK_PCT", "0.05"))  # % dark pixels in the inner area below which a side is blank
+QUALITY = ENV("SCAN_JPEG_QUALITY", "80")
+OCR_LANG = ENV("SCAN_OCR_LANG", "eng")
+DOUBLE_FEED = ENV("SCAN_DOUBLE_FEED", "yes") == "yes"
+SMART_NAMES = ENV("SCAN_SMART_NAMES", "yes") == "yes"
+SPLIT = ENV("SCAN_SPLIT", "yes") == "yes"
+SIMILAR = float(ENV("SCAN_SIMILAR", "0.2"))       # thumbnail distance below which two pages share a template
+CARD_MAX_IN = (4.2, 2.8)                          # long side, short side (inches) for "business card"
+WORKERS = os.cpu_count() or 4
+
+
+def log(*a):
+    print(*a, flush=True)
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def pmap(fn, items):
+    with ThreadPoolExecutor(WORKERS) as ex:
+        return list(ex.map(fn, items))
+
+
+def notify(summary, body="", urgency="normal", open_path=None):
+    log(summary, body)
+    if not shutil.which("notify-send"):
+        return
+    args = ["-a", "Scanner", "-u", urgency, summary, body]
+    if open_path:
+        # Clicking the notification (default action) opens the file/folder.
+        # Detached, so the button watcher isn't blocked while the notification is up.
+        script = 'a=$(notify-send --action=default=Open --wait "$@"); [ "$a" = default ] && xdg-open "$OPEN"'
+        subprocess.Popen(["sh", "-c", script, "sh", *args],
+                         env={**os.environ, "OPEN": str(open_path)},
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    else:
+        subprocess.run(["notify-send", *args], check=False)
+
+
+# ---------------------------------------------------------------- scanning
+
+HANG_SECS = int(ENV("SCAN_HANG_SECS", "60"))
+CROP = ENV("SCAN_CROP", "auto")            # auto = our own crop; scanner = SANE swcrop; none = keep frames
+OVERSCAN = ENV("SCAN_OVERSCAN", "yes") == "yes"
+KEEP_RAW = int(ENV("SCAN_KEEP_RAW", "3"))     # processed scans whose raw frames are kept in the queue's done/ folder
+FRAME_MM = ENV("SCAN_FRAME_MM", "356")     # scan frame length; sheets longer than this jam
+
+
+def scan(work: Path):
+    cmd = ["scanimage", "-d", DEVICE, "--source", SOURCE, "--mode", MODE, "--resolution", str(RES)]
+    if CROP == "scanner":
+        # SANE's software crop/deskew: hangs now and then, leaves cards tilted, letter length max.
+        cmd += ["--swcrop=yes", "--swdeskew=yes"]
+    else:
+        # Raw frame, FRAME_MM long (default 14 in); autocrop() finds the sheet on the gray backing.
+        cmd += ["--page-height", FRAME_MM, "-y", FRAME_MM]
+        if OVERSCAN:
+            # Start the frame a few mm before the sheet arrives. Without it the frame starts at the
+            # sheet's leading edge, and a card fed slightly skewed loses the corner that came first.
+            cmd += ["--overscan", "On"]
+    if DOUBLE_FEED:
+        cmd += ["--df-action", "Stop", "--df-thickness=yes"]
+    cmd += ["--format=tiff", f"--batch={work}/p%04d.tif"]
+    errf = work / "scanimage.log"
+    with open(errf, "w") as err:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=err)
+        # Watchdog: SANE's software crop/deskew has been seen spinning forever on one card side
+        # (100% CPU, no I/O). A side normally takes 1-4 s, so no new page for HANG_SECS = hung.
+        last_count, last_change = 0, dt.datetime.now()
+        while proc.poll() is None:
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            count = len(list(work.glob("p*.tif")))
+            if count != last_count:
+                last_count, last_change = count, dt.datetime.now()
+            elif (dt.datetime.now() - last_change).total_seconds() > HANG_SECS:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                sheet = count // (2 if "Duplex" in SOURCE else 1) + 1
+                return f"scanner software hung on sheet {sheet}; rescan from that sheet"
+    stderr = errf.read_text()
+    errf.unlink()
+    # Exit 7 = "Document feeder out of documents": the normal end of a batch.
+    if proc.returncode in (0, 7):
+        return None
+    if "jammed" in stderr.lower():
+        return "jam"
+    lines = stderr.strip().splitlines()
+    return lines[-1] if lines else f"scanimage exit {proc.returncode}"
+
+
+# ---------------------------------------------------------------- per-side processing
+
+@dataclass
+class Side:
+    src: Path
+    w: int = 0
+    h: int = 0
+    dark: float = 0.0
+    rotate: int = 0          # degrees clockwise to make it upright
+    osd_conf: float = 0.0
+    jpg: Path | None = None
+    pdf: Path | None = None
+    thumb: Path | None = None
+    text: str = ""
+    card: bool = False
+    skew: float = 0.0
+    crop_note: str = ""
+
+    @property
+    def blank(self):
+        return self.dark < BLANK_PCT
+
+
+@dataclass
+class Sheet:
+    sides: list
+    card: bool = False
+
+    @property
+    def content(self):
+        return [s for s in self.sides if not s.blank]
+
+
+def _f(cmd):
+    return run(cmd).stdout.strip()
+
+
+def find_outline(side: Side):
+    """Find the sheet on the scanner's light-gray backing.
+
+    The raw frame is the full scan width and FRAME_MM long; the sheet starts at the top and the
+    rest is backing (gray with faint vertical streaks). The bottom rows give the backing color per
+    column; whatever differs from it is the sheet.
+    Returns {"keep": note} (leave the frame alone), or a dict with the frame size, the lowest row
+    of the sheet ("bottom") and, if the sheet shows as a clean rectangle ("ok"), its angle and its
+    box after rotating by that angle.
+    """
+    src, tmp = side.src, str(side.src.with_suffix("")) + "-ac"
+    g, bg, m = tmp + "-g.png", tmp + "-bg.png", tmp + "-m.png"
+    W, H = map(int, _f(["magick", "identify", "-format", "%w %h", str(src)]).split())
+    sw = 320
+    f = W / sw
+    run(["magick", str(src), "-resize", f"{sw}x", g], check=True)      # color: pink paper ~ backing in gray
+    gw, gh = map(int, _f(["magick", "identify", "-format", "%w %h", g]).split())
+    strip = ["-gravity", "South", "-crop", "100%x3%+0+0", "+repage"]
+    try:
+        # Backing color per column, from the bottom rows, stretched over the frame
+        run(["magick", g, *strip, "-scale", f"{gw}x1!", "-scale", f"{gw}x{gh}!", bg], check=True)
+        # Per-pixel distance from the backing (largest channel difference)
+        d = tmp + "-d.png"
+        run(["magick", g, bg, "-compose", "difference", "-composite", "-separate",
+             "-evaluate-sequence", "max", d], check=True)
+        # Is the bottom strip really backing? It is uniform down each column (only vertical streaks)
+        # and gray, not paper white. A sheet as long as the frame leaves paper there instead.
+        vary = float(_f(["magick", d, *strip, "-format", "%[fx:mean*255]", "info:"]))
+        bright = float(_f(["magick", g, *strip, "-colorspace", "Gray", "-format", "%[fx:mean*255]", "info:"]))
+        if vary > 4 or bright > 240 or bright < 150:
+            return {"keep": f"frame kept (bottom rows not backing: vary {vary:.1f}, level {bright:.0f})"}
+        # Sheet mask: clearly different from the backing; drop specks, close text-sized gaps
+        run(["magick", d, "-threshold", "4%", "-morphology", "Open", "Square:1",
+             "-define", "connected-components:area-threshold=80", "-define", "connected-components:mean-color=true",
+             "-connected-components", "8", "-threshold", "50%", "-morphology", "Close", "Square:6", m], check=True)
+        info = _f(["magick", m, "-format",
+                   "%[fx:mean] %[minimum-bounding-box:width] %[minimum-bounding-box:height] "
+                   "%[minimum-bounding-box:unrotate] %@", "info:"]).split()
+        try:
+            white, bw, bh, unrot = (float(x) for x in info[:4])
+            bx_w, bx_h, bx_x, bx_y = map(int, re.split(r"[x+]", info[4]))
+        except (ValueError, IndexError):
+            return {"keep": "frame kept (no sheet found)"}
+        area = white * gw * gh
+        if area < 400:
+            return {"keep": "frame kept (no sheet found)"}
+        unrot = (unrot + 45) % 90 - 45        # the box angle is only defined modulo 90°
+        fill = area / max(bw * bh, 1)
+        o = {"W": W, "H": H, "f": f, "gw": gw, "fill": fill, "unrot": unrot,
+             "bottom": min(H, int((bx_y + bx_h + 2) * f)),
+             # A clean rectangle starting at the top. Crumpled sheets, paper close to the backing
+             # color and sides where only the print stands out fail this.
+             "ok": fill >= 0.6 and abs(unrot) <= (30 if fill >= 0.8 else 15) and bx_y <= 0.06 * gh}
+        if o["ok"]:
+            # +repage: -rotate leaves a negative page offset, and both %@ and -crop count from it
+            geo = _f(["magick", m, "-background", "black", "-rotate", f"{unrot}", "+repage", "-format", "%w %@", "info:"])
+            rot_w, box = geo.split()
+            o["rot_w"] = int(rot_w)
+            o["box"] = tuple(map(int, re.split(r"[x+]", box)))    # w, h, x, y in small pixels
+        return o
+    finally:
+        for t in (g, bg, m, tmp + "-d.png"):
+            Path(t).unlink(missing_ok=True)
+
+
+def apply_outline(side: Side, o, mirrored=False):
+    """Rotate and crop side.src by outline `o`. mirrored: `o` was found on the other side of the
+    sheet, which shows the same outline flipped left-right."""
+    src, out = side.src, Path(str(side.src.with_suffix("")) + "-ac.tif")
+    bgcolor = _f(["magick", str(src), "-gravity", "South", "-crop", "100%x1%+0+0", "+repage",
+                  "-scale", "1x1!", "-format", "#%[hex:p{0,0}]", "info:"]) or "#d8dcdc"
+    f, (rw, rh, rx, ry), angle = o["f"], o["box"], o["unrot"]
+    inset = 1   # small-scale px per side, drops most of the edge shadow
+    if mirrored:
+        angle, rx, inset = -angle, o["rot_w"] - rx - rw, -2   # 2 px looser: the two sensors aren't aligned exactly
+    crop = f"{int((rw - 2 * inset) * f)}x{int((rh - 2 * inset) * f)}+{max(0, int((rx + inset) * f))}+{max(0, int((ry + inset) * f))}"
+    run(["magick", str(src), "-background", bgcolor, "-rotate", f"{angle}", "+repage", "-crop", crop, "+repage",
+         str(out)], check=True)
+    side.src = out
+
+
+def autocrop(pair):
+    """Straighten and crop the side(s) of one sheet. Replaces side.src with the cropped image.
+
+    Both sides show the same sheet, so a side whose own outline isn't clear (white back on the
+    light backing, only a logo standing out) uses the outline found on the other side."""
+    if CROP != "auto":
+        return
+    found = [find_outline(s) for s in pair]
+    for i, (side, o) in enumerate(zip(pair, found)):
+        other = found[1 - i] if len(pair) == 2 else None
+        if "keep" in o:
+            side.crop_note = o["keep"]
+        elif o["ok"]:
+            apply_outline(side, o)
+            side.crop_note = f"cropped, outline angle {o['unrot']:.1f}"
+        elif other and other.get("ok"):
+            apply_outline(side, other, mirrored=True)
+            side.crop_note = f"cropped by the other side's outline (own fill {o['fill']:.2f}, angle {o['unrot']:.1f})"
+        else:
+            # Don't trust the outline. Keep the full width, cut only the backing below the sheet.
+            out = Path(str(side.src.with_suffix("")) + "-ac.tif")
+            run(["magick", str(side.src), "-crop", f"{o['W']}x{o['bottom']}+0+0", "+repage", str(out)], check=True)
+            side.src = out
+            side.crop_note = f"length only (fill {o['fill']:.2f}, angle {o['unrot']:.1f})"
+
+
+def measure(side: Side):
+    # Inner ~88% x 84% only: edge shadows and crop slivers made blank backs look 1-2% dark.
+    out = run(["magick", str(side.src), "-format", "%w %h\n", "-write", "info:-",
+               "-gravity", "center", "-crop", "88%x84%+0+0", "+repage",
+               "-colorspace", "Gray", "-statistic", "Median", "3x3", "-threshold", "55%",
+               "-format", "%[fx:100*(1-mean)]", "info:"], check=True).stdout.split()
+    side.w, side.h, side.dark = int(out[0]), int(out[1]), float(out[2])
+
+
+def is_card(w, h):
+    long_in, short_in = max(w, h) / RES, min(w, h) / RES
+    return long_in <= CARD_MAX_IN[0] and short_in <= CARD_MAX_IN[1]
+
+
+def osd(img: Path):
+    """(rotate_degrees, confidence) from tesseract orientation detection."""
+    r = run(["tesseract", str(img), "-", "--psm", "0", "--dpi", str(RES)])
+    rot = re.search(r"Rotate: (\d+)", r.stdout)
+    conf = re.search(r"Orientation confidence: ([\d.]+)", r.stdout)
+    return (int(rot.group(1)) if rot else 0), (float(conf.group(1)) if conf else 0.0)
+
+
+def read_score(img: Path, rotate: int):
+    """How well the image reads at a rotation: confident, word-like OCR tokens."""
+    p = subprocess.run(f'magick "{img}" -rotate {rotate} -colorspace Gray png:- | '
+                       f'tesseract - - --psm 11 --dpi {RES} tsv',
+                       shell=True, capture_output=True, text=True)
+    score = 0.0
+    for line in p.stdout.splitlines()[1:]:
+        cols = line.split("\t")
+        if len(cols) < 12:
+            continue
+        conf, word = float(cols[10]), cols[11]
+        if conf > 60 and len(word) >= 3 and re.fullmatch(r"[A-Za-z][A-Za-z'-]+[a-z]", word):
+            score += len(word) * conf / 100
+    return score
+
+
+def orient(item):
+    side, card = item
+    if card:
+        # Cards: little text, OSD is unreliable -> try all four orientations.
+        scores = {rot: read_score(side.src, rot) for rot in (0, 90, 180, 270)}
+        side.rotate = max(scores, key=scores.get)
+        side.osd_conf = scores[side.rotate]
+        return
+    rot, conf = osd(side.src)
+    side.osd_conf = conf
+    if conf >= 2.0:
+        side.rotate = rot
+    else:
+        # Unsure: compare upright vs upside down (most common mistake: sheet loaded reversed).
+        side.rotate = 180 if read_score(side.src, 180) > 1.3 * read_score(side.src, 0) else 0
+
+
+def fix_sheet_orientation(sheet: Sheet):
+    """Both sides of a sheet get flipped together; let a confident side decide."""
+    sides = sheet.content
+    if len(sides) == 1 and sheet.card and sides[0].osd_conf < 5 and sides[0].h > sides[0].w:
+        sides[0].rotate = 90 if sides[0] is sheet.sides[0] else 270
+    if len(sides) != 2:
+        return
+    if sheet.card:
+        # The back is the front seen from behind, mirrored left-right: if the front needs 90°
+        # clockwise, the back needs 270°. A side with no readable text (logo, QR, dark print)
+        # follows the readable one. If neither reads, at least lay a portrait card on its side.
+        a, b = sorted(sides, key=lambda s: -s.osd_conf)
+        if a.osd_conf >= 5 > b.osd_conf:
+            b.rotate = (360 - a.rotate) % 360
+        elif a.osd_conf < 5:
+            front, back = sides
+            if front.h > front.w:
+                front.rotate, back.rotate = 90, 270
+        return
+    a, b = sorted(sides, key=lambda s: -s.osd_conf)
+    if a.osd_conf >= 5 and b.osd_conf < 2 and a.rotate in (0, 180):
+        b.rotate = a.rotate
+
+
+CARD_QUALITY = ENV("SCAN_CARD_JPEG_QUALITY", "92")
+
+
+def card_straighten(side: Side, max_angle=10):
+    """magick args that level a tilted card and trim the backing-plate border.
+
+    The iX500's backing plate is light gray and most cards are white, so SANE's swdeskew can't
+    find card edges and leaves cards 1-3 degrees off. The text lines are a better guide.
+    """
+    r = run(["magick", str(side.src), "-rotate", str(side.rotate), "-resize", "50%",
+             "-colorspace", "Gray", "-deskew", "40%", "-format", "%[deskew:angle]", "info:"])
+    try:
+        angle = float(r.stdout.strip())
+    except ValueError:
+        return []
+    side.skew = angle
+    if not 0.2 <= abs(angle) <= max_angle:
+        return []
+    # Fill the corners exposed by the rotation with the backing color, then trim that border.
+    bg = run(["magick", str(side.src), "-gravity", "SouthEast", "-crop", "6x6+0+0", "+repage",
+              "-scale", "1x1!", "-format", "#%[hex:p{0,0}]", "info:"]).stdout.strip() or "white"
+    return ["-background", bg, "-rotate", f"{angle:.3f}", "-bordercolor", bg, "-border", "2",
+            "-fuzz", "10%", "-trim", "+repage"]
+
+
+def render(side: Side):
+    """Rotate, JPEG, OCR -> one-page PDF with text layer, plus text and a thumbnail."""
+    base = side.src.with_suffix("")
+    side.jpg = base.with_name(base.name + "-r.jpg")
+    upscale = 2 if side.card else 1   # small print on cards OCRs much better at 2x
+    if side.card:
+        card_prep = card_straighten(side) + ["-resize", "200%", "-unsharp", "0x1.2+0.7+0.02"]
+    else:
+        card_prep = card_straighten(side, max_angle=3) if CROP == "auto" else []
+    run(["magick", str(side.src), "-rotate", str(side.rotate), *card_prep,
+         "-quality", CARD_QUALITY if side.card else QUALITY,
+         "-density", str(RES * upscale), "-units", "PixelsPerInch", str(side.jpg)],
+        check=True)
+    run(["magick", str(side.jpg), "-colorspace", "Gray", "-resize", "48x64!", "-normalize",
+         str(base) + "-t.pgm"], check=True)
+    side.thumb = Path(str(base) + "-t.pgm")
+    out = base.with_name(base.name + "-ocr")
+    run(["tesseract", str(side.jpg), str(out), "-l", OCR_LANG, "--dpi", str(RES * upscale), "pdf", "txt"])
+    side.pdf, txt = out.with_suffix(".pdf"), out.with_suffix(".txt")
+    side.text = txt.read_text(errors="replace") if txt.exists() else ""
+    if side.card and card_fields(side.text)[0] is None:
+        # Default layout analysis sometimes garbles small cards; "one block" mode often reads them,
+        # but merges side-by-side columns, so it's only a fallback (used for naming, not the PDF).
+        r = run(["tesseract", str(side.jpg), "-", "-l", OCR_LANG, "--dpi", str(RES * upscale), "--psm", "6"])
+        if card_fields(r.stdout)[0]:
+            side.text = r.stdout + "\n" + side.text
+
+
+def distance(a: Side, b: Side):
+    """0 = identical layout, ~0.3-0.6 = unrelated pages."""
+    r = run(["magick", "compare", "-metric", "NCC", str(a.thumb), str(b.thumb), "null:"])
+    m = re.search(r"\(([\d.]+)\)", r.stderr)
+    return float(m.group(1)) if m else 1.0
+
+
+# ---------------------------------------------------------------- splitting
+
+PAGE_NUM = re.compile(r"(?i)\b(?:page\s*)?(\d{1,3})\s*(?:of|0f|o0f)\s*(\d{1,3})\b")
+
+
+def page_number(text):
+    """(k, n) from 'Page k of n' / 'k of n', tolerating OCR like '10f1' or '70of8'."""
+    for m in PAGE_NUM.finditer(text):
+        k, n = m.group(1), int(m.group(2))
+        if int(k) > n and k.endswith("0"):    # '10f1' = '1 0f 1', '70of8' = '7 0of 8'
+            k = k[:-1]
+        k = int(k) if k else 0
+        if 1 <= k <= n <= 60:
+            return k, n
+    return None
+
+
+@dataclass
+class Doc:
+    sheets: list = field(default_factory=list)
+    first: Side | None = None
+    numbering: tuple | None = None   # (last_k, n)
+
+    def add(self, sheet: Sheet):
+        self.sheets.append(sheet)
+        for s in sheet.content:
+            self.first = self.first or s
+            pn = page_number(s.text)
+            if pn and (not self.numbering or pn[1] == self.numbering[1]):
+                self.numbering = (max(pn[0], self.numbering[0] if self.numbering else 0), pn[1])
+
+    @property
+    def complete(self):
+        return bool(self.numbering) and self.numbering[0] == self.numbering[1]
+
+    @property
+    def sides(self):
+        return [s for sh in self.sheets for s in sh.content]
+
+
+def starts_new(doc: Doc, sheet: Sheet):
+    """Score whether `sheet` starts a new document after `doc`. Returns (bool, reasons)."""
+    front = sheet.content[0]
+    score, why = 0, []
+    pn = page_number(front.text)
+    if pn and pn[0] == 1:
+        score += 3; why.append(f"'1 of {pn[1]}'")
+    if doc.complete:
+        score += 3; why.append(f"previous doc complete ({doc.numbering[0]} of {doc.numbering[1]})")
+    if pn and pn[0] > 1 and doc.numbering and pn[1] == doc.numbering[1] and pn[0] > doc.numbering[0]:
+        score -= 3; why.append(f"continues numbering ({pn[0]} of {pn[1]})")
+    prev = doc.sheets[-1].content[0]
+    a, b = sorted((front.w, front.h)), sorted((prev.w, prev.h))
+    if min(a) and min(b) and any(abs(x - y) > 0.08 * max(x, y) for x, y in zip(a, b)):
+        score += 2; why.append(f"different paper size ({a[0]}x{a[1]} vs {b[0]}x{b[1]} px)")
+    d = distance(front, doc.first)
+    if d < SIMILAR:
+        score += 2; why.append(f"same template as doc's first page ({d:.2f})")
+    return score >= 2, why
+
+
+def fix_side_order(sheet: Sheet):
+    """Sheets fed back side first: put the side with the lower page number (or the only numbered
+    'page 1') in front, so the document starts with its first page and splitting sees it."""
+    if sheet.card or len(sheet.sides) != 2 or len(sheet.content) != 2:
+        return False
+    a, b = (page_number(s.text) for s in sheet.sides)
+    if b and ((a and a[1] == b[1] and b[0] < a[0]) or (not a and b[0] == 1)):
+        sheet.sides.reverse()
+        return True
+    return False
+
+
+def split_documents(sheets, dry=False):
+    """[(kind, [sides])] in feed order."""
+    groups, doc = [], None
+
+    def close():
+        nonlocal doc
+        if doc and doc.sides:
+            groups.append(("doc", doc.sides))
+        doc = None
+
+    for i, sheet in enumerate(sheets, 1):
+        if not sheet.content:
+            if dry:
+                log(f"sheet {i}: blank -> separator")
+            close()
+            continue
+        if sheet.card:
+            groups.append(("card", sheet.content))
+            if dry:
+                log(f"sheet {i}: business card")
+            continue
+        if doc is None:
+            doc = Doc()
+            if dry:
+                log(f"sheet {i}: new document")
+        elif SPLIT:
+            new, why = starts_new(doc, sheet)
+            if dry:
+                log(f"sheet {i}: {'NEW document' if new else 'continue'}  {'; '.join(why)}")
+            if new:
+                close()
+                doc = Doc()
+        doc.add(sheet)
+    close()
+    return groups
+
+
+# ---------------------------------------------------------------- naming
+
+MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+DATE_RES = [
+    (re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b"), "ymd"),
+    (re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4}|\d{2})\b"), "mdy"),
+    (re.compile(r"\b([A-Z][a-z]{2,8})\.? (\d{1,2}),? (\d{4})\b"), "Mdy"),
+    (re.compile(r"\b(\d{1,2}) ([A-Z][a-z]{2,8})\.? (\d{4})\b"), "dMy"),
+]
+DATE_LABEL = re.compile(r"(statement|invoice|bill|issue[d]?|letter|print|service)?\s*date\b", re.I)
+DOC_TYPES = ["invoice", "receipt", "statement", "bill", "explanation of benefits", "prescription",
+             "application", "contract", "agreement", "policy", "notice", "letter", "report", "estimate",
+             "quote", "1099", "w-2"]
+NOT_SENDER = re.compile(
+    r"\b(page|statement|invoice|receipt|date|total|amount|account|balance|due|please|"
+    r"payment|customer|number|address|phone|fax|email|www|http|enroll|summary|services?|pay|online|tax)\b", re.I)
+COMPANY_HINT = re.compile(
+    r"\b(inc|llc|ltd|corp|corporation|company|co|gmbh|group|bank|health|hospital|clinic|insurance|"
+    r"university|college|services|partners|associates|labs?|systems|technologies|solutions)\b\.?", re.I)
+TITLE_WORDS = re.compile(
+    r"\b(manager|director|engineer|president|ceo|cto|cfo|coo|vp|vice|sales|officer|founder|"
+    r"senior|sr|lead|head|consultant|partner|specialist|analyst|designer|developer|agent|"
+    r"representative|assistant|coordinator|owner|principal|architect|account|executive)\b", re.I)
+
+
+def _mk_date(y, m, d):
+    y = int(y)
+    y = y + 2000 if y < 100 else y
+    try:
+        date = dt.date(y, int(m), int(d))
+    except ValueError:
+        return None
+    today = dt.date.today()
+    return date if dt.date(1990, 1, 1) <= date <= today + dt.timedelta(days=366) else None
+
+
+def find_dates(text):
+    """[(position, date)] for every plausible date in the text."""
+    found = []
+    for rx, kind in DATE_RES:
+        for m in rx.finditer(text):
+            g = m.groups()
+            if kind == "ymd":
+                d = _mk_date(*g)
+            elif kind == "mdy":
+                d = _mk_date(g[2], g[0], g[1])
+            else:
+                mon, day, yr = (g[0], g[1], g[2]) if kind == "Mdy" else (g[1], g[0], g[2])
+                mi = MONTHS.get(mon[:3].lower())
+                d = _mk_date(yr, mi, day) if mi else None
+            if d:
+                found.append((m.start(), d))
+    return sorted(found)
+
+
+def doc_date(text):
+    dates = find_dates(text)
+    if not dates:
+        return None
+    # Prefer a date that follows a "... Date" label (not "Due Date") within ~60 chars.
+    for m in DATE_LABEL.finditer(text):
+        before = text[max(0, m.start() - 6):m.start()].lower()
+        if "due" in before or "due" in m.group(0).lower():
+            continue
+        for pos, d in dates:
+            if m.end() <= pos <= m.end() + 60:
+                return d
+    # Otherwise the first date that isn't right after "due".
+    for pos, d in dates:
+        if "due" not in text[max(0, pos - 25):pos].lower():
+            return d
+    return dates[0][1]
+
+
+def clean_words(line):
+    """Keep word-like tokens (letters, & . ' -), dropping OCR junk such as 'X7,'."""
+    words = []
+    for tok in line.split():
+        tok = tok.strip(".,;:|!?()[]{}\"'-–—_*~")
+        if len(tok) >= 2 and re.fullmatch(r"[A-Za-z][A-Za-z&.'’-]*", tok):
+            words.append(tok)
+        elif tok == "&":
+            words.append(tok)
+    return words
+
+
+GENERIC_DOMAINS = {"gmail", "yahoo", "hotmail", "outlook", "icloud", "aol", "proton", "protonmail",
+                   "personapay", "paypal", "google", "facebook", "twitter", "linkedin", "instagram"}
+
+
+def trim_company(words):
+    """'Acme Health eStatements' -> 'Acme Health': drop trailing words that start lowercase."""
+    while len(words) > 1 and words[-1][0].islower():
+        words = words[:-1]
+    return " ".join(words)
+
+
+def sender(text, max_lines=25):
+    # 1. Explicit: "... DBA Acme", "payable to Acme Corp"
+    m = re.search(r"\bDBA\s+([A-Z][\w&.'-]*(?: [A-Z][\w&.'-]*){0,3})", text)
+    if m:
+        return m.group(1).strip(" .,")
+    # 2. Letterhead: first capitalized line near the top with a company word
+    best = None
+    for line in [l for l in text.splitlines() if l.strip()][:max_lines]:
+        words = clean_words(line)
+        if not (2 <= len(words) <= 6) or NOT_SENDER.search(" ".join(words)):
+            continue
+        if sum(w[0].isupper() for w in words if w != "&") < len(words) - 1:
+            continue  # sentence, not a name
+        if COMPANY_HINT.search(" ".join(words)):
+            return trim_company(words)
+        best = best or " ".join(words)
+    # 3. Most frequent organisation domain: billing@acme.com, www.acme.com
+    domains = [d.lower() for d in re.findall(r"(?:@|www\.|https?://)([a-z0-9-]+)\.(?:com|org|net|edu|gov|io|co)\b",
+                                             text, re.I) if d.lower() not in GENERIC_DOMAINS]
+    if domains:
+        return max(set(domains), key=domains.count).replace("-", " ").title()
+    return best
+
+
+def doc_type(text):
+    low = text.lower()
+    hits = [(low.find(t), t) for t in DOC_TYPES if re.search(rf"\b{re.escape(t)}\b", low)]
+    return min(hits)[1] if hits else None
+
+
+PERSON = re.compile(r"[A-Z][a-zA-Z'’-]+(?: (?:[A-Z]\.?|[A-Z][a-zA-Z'’-]+)){1,3}")
+
+
+NOT_NAME = {"an", "the", "always", "current", "of", "and", "for", "your", "our", "we", "visit",
+            "website", "make", "it", "happen", "channel", "partner", "global", "head", "office",
+            "region", "united", "states", "kingdom", "america", "americas", "usa", "europe", "asia",
+            "headquarters", "branch", "division", "department"}
+
+
+def card_fields(text):
+    """(person, company) from business-card OCR text."""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    company, people = None, []
+    for i, line in enumerate(lines):
+        if "@" in line or re.search(r"\d{3}", line):
+            continue
+        words = clean_words(line)
+        cand = " ".join(words)
+        if not company and COMPANY_HINT.search(cand) and len(words) <= 6 \
+                and not TITLE_WORDS.search(cand) and not COMPANY_HINT.fullmatch(cand):
+            company = trim_company(words)
+            continue
+        name = re.sub(r"(?<=\w)[;:|,](?=\w)", "", line).strip(" .,|\\/")   # 'Mic;hael' -> 'Michael'
+        if not PERSON.fullmatch(name) or TITLE_WORDS.search(cand) or COMPANY_HINT.search(cand):
+            continue
+        if any(w.lower().strip(".") in NOT_NAME for w in name.split()):
+            continue
+        score = 0
+        neighbours = lines[max(0, i - 1):i] + lines[i + 1:i + 3]
+        if any(TITLE_WORDS.search(n) for n in neighbours):
+            score += 3                       # a job title right next to it
+        if not name.isupper():
+            score += 1                       # "Lorenzo Belluccia" rather than "AN ACT"
+        if i < 4:
+            score += 1                       # names are usually near the top
+        people.append((score, -i, name))
+    person = max(people)[2] if people else None
+    if not company:
+        # Fall back to the email/web domain: jane@acme-robotics.com -> "Acme Robotics"
+        m = re.search(r"[\w.+-]+@([\w-]+)\.[\w.]+", text) or re.search(r"www\.([\w-]+)\.", text, re.I)
+        if m and m.group(1).lower() not in GENERIC_DOMAINS:
+            company = m.group(1).replace("-", " ").title()
+    return person, company
+
+
+def safe(s, maxlen=80):
+    s = re.sub(r"[/\\:*?\"<>|\x00-\x1f]", "", s)
+    return re.sub(r"\s+", " ", s).strip()[:maxlen].strip()
+
+
+def name_for(kind, text, scanned_at, index):
+    stamp = scanned_at.strftime("%Y-%m-%d_%H%M%S")
+    if not SMART_NAMES:
+        return f"scan-{stamp}" + (f"-card{index}" if kind == "card" else "")
+    if kind == "card":
+        person, company = card_fields(text)
+        if person and company:
+            return safe(f"Business card - {person} ({company})")
+        if person or company:
+            return safe(f"Business card - {person or company}")
+        return f"Business card - {stamp}-{index}"
+    date, who, what = doc_date(text), sender(text), doc_type(text)
+    if not who and not what:
+        return f"scan-{stamp}"
+    parts = [(date or scanned_at.date()).isoformat(), who, what]
+    return safe(" ".join(p for p in parts if p))
+
+
+def unique(path: Path):
+    n, p = 2, path
+    while p.exists():
+        p = path.with_name(f"{path.stem} ({n}){path.suffix}")
+        n += 1
+    return p
+
+
+# ---------------------------------------------------------------- name clashes
+#
+# A new scan never overwrites a file. If its name is taken:
+#  - same content as an existing file (a rescan)  -> saved under duplicates/ instead
+#  - different content                            -> the name gets the detail that tells them
+#    apart: a reference/invoice/account number, else the amount, else the scan date.
+# Measured on real rescans: word overlap 0.89-0.96, number overlap 0.82-0.90. Different documents
+# on the same template (two months of one statement): words up to 0.86, numbers at most 0.56.
+
+DEDUPE = ENV("SCAN_DEDUPE", "yes") == "yes"
+LABELED = re.compile(r"(?i)\b(invoice|reference|statement|account|acct|claim|order|bill|parcel|policy|"
+                     r"confirmation|check|case)\s*(?:number|num|no\.?|id|#)?\s*[:#]?\s*([A-Z0-9][A-Z0-9-]{3,19})\b")
+AMOUNT = re.compile(r"(?i)\b(?:amount due|total due|balance due|new balance|amount paid|total)\b\D{0,15}?"
+                    r"\$?\s*(\d[\d,]*\.\d{2})\b")
+SHORT_LABEL = {"invoice": "inv", "reference": "ref", "statement": "stmt", "account": "acct", "acct": "acct",
+               "confirmation": "conf"}
+
+
+def fingerprint(text):
+    words = set(re.findall(r"[a-z]{3,}", text.lower()))
+    nums = {t for t in re.findall(r"[\w$.,/-]*\d[\w.,/-]*", text) if len(re.sub(r"\D", "", t)) >= 3}
+    return words, nums
+
+
+def same_content(a, pages, b):
+    """True if two OCR texts are the same paper scanned twice (b = pdftotext of an existing file)."""
+    if pages != b.count("\f"):
+        return False                       # different page count
+    (wa, na), (wb, nb) = fingerprint(a), fingerprint(b)
+    if len(wa) < 15 or len(wb) < 15:
+        return False                       # too little text to judge; keep both
+    jac = lambda x, y: len(x & y) / max(1, len(x | y))
+    return jac(wa, wb) >= 0.8 and (jac(na, nb) >= 0.7 or not (na or nb))
+
+
+def distinguisher(text, others, scanned_at):
+    """A short detail found in `text` but in none of `others`."""
+    absent = lambda v: all(v not in o for o in others)
+    for m in LABELED.finditer(text):
+        label, value = m.group(1).lower(), m.group(2)
+        if sum(c.isdigit() for c in value) >= 4 and absent(value):
+            if label in ("account", "acct", "policy"):
+                value = "…" + value[-4:]   # don't put whole account numbers in file names
+            return f"{SHORT_LABEL.get(label, label)} {value}"
+    for m in AMOUNT.finditer(text):
+        if absent(m.group(1)):
+            return f"${m.group(1)}"
+    return f"scanned {scanned_at:%Y-%m-%d}"
+
+
+def pdf_text(path: Path):
+    return run(["pdftotext", str(path), "-"]).stdout
+
+
+def place(name, text, pages, scanned_at):
+    """(destination, existing file this duplicates or None) for a new PDF called `name`."""
+    import glob
+    plain = OUTDIR / f"{name}.pdf"
+    if not DEDUPE:
+        return unique(plain), None
+    taken = [Path(p) for p in sorted(glob.glob(str(OUTDIR / (glob.escape(name) + "*.pdf"))))]
+    if not taken:
+        return plain, None
+    others = {p: pdf_text(p) for p in taken}
+    for p, t in others.items():
+        if same_content(text, pages, t):
+            dup = OUTDIR / "duplicates"
+            dup.mkdir(parents=True, exist_ok=True)
+            return unique(dup / f"{name}.pdf"), p
+    if not plain.exists():
+        return plain, None
+    return unique(OUTDIR / safe(f"{name} - {distinguisher(text, list(others.values()), scanned_at)}.pdf", 120)), None
+
+
+# ---------------------------------------------------------------- processing
+
+IMG_EXT = (".tif", ".tiff", ".jpg", ".jpeg", ".png")
+
+
+def process(src_dir: Path, scanned_at, problem=None, dry=False):
+    """Turn a folder of scanned sides (p0001.tif, …) into named PDFs. Returns the saved paths."""
+    with tempfile.TemporaryDirectory(prefix="scan-") as tmp:
+        work = Path(tmp)
+        for f in sorted(src_dir.glob("p*")):
+            if f.suffix.lower() in IMG_EXT:
+                (work / f.name).symlink_to(f.resolve())   # outputs land in work/, source stays untouched
+        sides = [Side(p) for p in sorted(work.glob("p*")) if p.suffix.lower() in IMG_EXT]
+        if not sides:
+            notify("Scan failed", problem or "no pages", urgency="critical")
+            return []
+        per_sheet = 2 if "Duplex" in SOURCE else 1
+        pmap(autocrop, [sides[i:i + per_sheet] for i in range(0, len(sides), per_sheet)])
+        pmap(measure, sides)
+        sheets = [Sheet(sides[i:i + per_sheet]) for i in range(0, len(sides), per_sheet)]
+        for sh in sheets:
+            sh.card = is_card(sh.sides[0].w, sh.sides[0].h)
+            for sd in sh.sides:
+                sd.card = sh.card
+        content = [(s, sh.card) for sh in sheets for s in sh.content]
+        if not content:
+            notify("Scan produced only blank pages", urgency="critical")
+            return []
+        pmap(orient, content)
+        for sh in sheets:
+            fix_sheet_orientation(sh)
+        pmap(render, [s for s, _ in content])
+        for i, sh in enumerate(sheets, 1):
+            if fix_side_order(sh) and dry:
+                log(f"sheet {i}: sides swapped (fed back side first)")
+        if dry:
+            for i, sh in enumerate(sheets, 1):
+                log(f"sheet {i}: " + ", ".join(
+                    f"{s.src.name} [{s.crop_note}] {'blank' if s.blank else f'rot {s.rotate} (conf {s.osd_conf:.1f}) skew {s.skew:.1f}'}"
+                    for s in sh.sides) + (" [card]" if sh.card else ""))
+        groups = split_documents(sheets, dry)
+
+        saved, cards, dups = [], 0, []
+        if not dry:
+            OUTDIR.mkdir(parents=True, exist_ok=True)
+        for i, (kind, gsides) in enumerate(groups, 1):
+            text = "\n\f".join(s.text for s in gsides)
+            cards += kind == "card"
+            name = name_for(kind, text, scanned_at, cards)
+            if dry:
+                log(f"-> {name}.pdf  ({len(gsides)} page(s))")
+                continue
+            tmp_pdf = work / f"out{i}.pdf"
+            pdfs = [str(s.pdf) for s in gsides]
+            if len(pdfs) == 1:
+                shutil.copy(pdfs[0], tmp_pdf)
+            else:
+                run(["pdfunite", *pdfs, str(tmp_pdf)], check=True)
+            dest, dup_of = place(name, text, len(gsides), scanned_at)
+            shutil.move(tmp_pdf, dest)
+            if dup_of:
+                dups.append(dup_of)
+                cards -= kind == "card"
+                log(f"duplicate of {dup_of.name}: kept as {dest} ({len(gsides)} page(s), {kind})")
+                continue
+            saved.append(dest)
+            log(f"saved {dest} ({len(gsides)} page(s), {kind})")
+    if dry:
+        return saved
+
+    docs = len(saved) - cards
+    what = ", ".join(x for x in [f"{docs} document{'s' * (docs != 1)}" if docs else "",
+                                 f"{cards} business card{'s' * (cards != 1)}" if cards else ""] if x)
+    body = "\n".join(p.name for p in saved[:6]) + ("\n…" if len(saved) > 6 else "")
+    if dups:
+        body += f"\n{len(dups)} already scanned (kept in duplicates/): " + ", ".join(p.name for p in dups[:3])
+    if not saved:
+        notify("Nothing new: already scanned", body.strip(), open_path=dups[0] if len(dups) == 1 else OUTDIR)
+        return saved
+    if problem:
+        body = f"(scan stopped early: {'double feed / jam' if problem == 'jam' else problem})\n" + body
+    notify(f"Saved {what}", body, open_path=saved[0] if len(saved) == 1 else OUTDIR)
+    return saved
+
+
+# ---------------------------------------------------------------- queue
+#
+# The button watcher waits for `scan-to-pdf` to return before it watches the button again, so
+# scanning only puts the pages in a queue folder and returns. A worker (scan-process.service,
+# one at a time) processes queued scans oldest first. The queue is on disk, so closing the lid
+# (which stops the button service) or logging out doesn't lose scans; they're picked up next time.
+
+QUEUE = Path(os.path.expanduser(ENV("SCAN_QUEUE", "~/.local/state/scan-queue")))
+STAMP = "%Y-%m-%d_%H%M%S"
+
+
+def pending():
+    return sorted(p for p in QUEUE.iterdir() if p.is_dir() and re.fullmatch(r"\d{4}-\d\d-\d\d_\d{6}(-\d+)?", p.name)) \
+        if QUEUE.exists() else []
+
+
+def start_worker():
+    r = run(["systemctl", "--user", "start", "--no-block", "scan-process.service"])
+    if r.returncode != 0:   # service not installed: run a detached worker instead
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "--worker"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def scan_to_queue():
+    QUEUE.mkdir(parents=True, exist_ok=True)
+    now = dt.datetime.now()
+    name, n = now.strftime(STAMP), 2
+    while (QUEUE / name).exists() or (QUEUE / f"{name}.partial").exists():
+        name, n = f"{now.strftime(STAMP)}-{n}", n + 1
+    part = QUEUE / f"{name}.partial"
+    part.mkdir()
+    ahead = len(pending())
+    notify("Scanning…")
+    problem = scan(part)
+    sides = len(list(part.glob("p*.tif")))
+    if not sides:
+        shutil.rmtree(part)
+        notify("Scan failed", problem or "no pages", urgency="critical")
+        return 1
+    if problem:
+        (part / "problem").write_text(problem)
+    part.rename(QUEUE / name)             # complete: the worker may take it now
+    if problem:                           # tell right away, not after processing
+        title = "Double feed / jam — scan stopped" if problem == "jam" else "Scan stopped early"
+        detail = "Check the last sheets and scan the rest." if problem == "jam" else problem
+        notify(title, f"{sides} side(s) scanned and queued.\n{detail}", urgency="critical")
+    else:
+        notify(f"Scanned {sides} side(s)",
+               "Processing…" + (f" ({ahead} scan{'s' * (ahead != 1)} ahead in the queue)" if ahead else "")
+               + "\nYou can scan the next stack now.")
+    start_worker()
+    return 0
+
+
+def worker():
+    import fcntl
+    QUEUE.mkdir(parents=True, exist_ok=True)
+    while True:
+        with open(QUEUE / ".lock", "w") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return 0                  # another worker is running; it will pick up new jobs
+            while jobs := pending():
+                job = jobs[0]
+                log(f"processing {job.name}")
+                problem = (job / "problem").read_text() if (job / "problem").exists() else None
+                try:
+                    scanned_at = dt.datetime.strptime(job.name[:17], STAMP)
+                    process(job, scanned_at, problem)
+                    done = QUEUE / "done"       # raw frames of the last few scans, for reprocessing
+                    done.mkdir(exist_ok=True)
+                    shutil.move(job, done / job.name)
+                    for old in sorted(done.iterdir())[:-KEEP_RAW] if KEEP_RAW > 0 else sorted(done.iterdir()):
+                        shutil.rmtree(old, ignore_errors=True)
+                except Exception as e:  # keep the pages; don't block the rest of the queue
+                    failed = QUEUE / "failed"
+                    failed.mkdir(exist_ok=True)
+                    shutil.move(job, failed / job.name)
+                    log(f"FAILED {job.name}: {e!r}")
+                    notify("Processing a scan failed", f"Pages kept in {failed / job.name}\n{e}",
+                           urgency="critical", open_path=failed / job.name)
+        if not pending():                 # a scan may have arrived just as we released the lock
+            return 0
+
+
+# ---------------------------------------------------------------- main
+
+def main(argv):
+    dry = "--dry-run" in argv
+    argv = [a for a in argv if a != "--dry-run"]
+    if argv[:1] == ["--from-dir"] and len(argv) == 2:
+        process(Path(argv[1]), dt.datetime.now(), dry=dry)
+        return 0
+    if argv == ["--worker"]:
+        return worker()
+    if argv:
+        print(__doc__, file=sys.stderr)
+        return 64
+    return scan_to_queue()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

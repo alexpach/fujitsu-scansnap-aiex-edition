@@ -1,0 +1,11 @@
+[Unit]
+Description=Start the ScanSnap button watcher at login if the scanner is already on
+# udev's SYSTEMD_USER_WANTS only fires when the scanner appears while the user session is
+# running. If it was already on at boot/login, nothing starts scan-button.service; this does.
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'systemctl --user is-active -q dev-scansnap.device && systemctl --user start --no-block scan-button.service || true'
+
+[Install]
+WantedBy=default.target

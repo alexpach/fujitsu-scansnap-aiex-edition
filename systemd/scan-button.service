@@ -1,0 +1,14 @@
+[Unit]
+Description=ScanSnap scan button -> PDF in ~/Notes/Scans
+# Started by udev (99-scansnap.rules) when the scanner appears on USB, i.e.
+# when its lid/paper chute is opened; stopped again when it disappears.
+BindsTo=dev-scansnap.device
+After=dev-scansnap.device
+
+[Service]
+EnvironmentFile=-%h/.config/scan-button.env
+ExecStart=%h/.local/bin/scan-button-watch -i 1000 -- %h/.local/bin/scan-to-pdf
+# Pick up scans left in the queue (e.g. lid closed or logout while processing).
+ExecStartPost=-/usr/bin/systemctl --user start --no-block scan-process.service
+Restart=on-failure
+RestartSec=5

@@ -1,0 +1,10 @@
+[Unit]
+Description=Process queued ScanSnap scans (OCR, split, name) into ~/Notes/Scans
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/scan-button.env
+ExecStart=%h/.local/bin/scan-to-pdf --worker
+# Background work: don't make the desktop sluggish.
+Nice=10
+IOSchedulingClass=idle
