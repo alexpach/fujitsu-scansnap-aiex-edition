@@ -127,6 +127,15 @@ and anything left in the queue (e.g. after a logout) is picked up the next time 
 on. If processing fails, the pages are kept in `~/.local/state/scan-queue/failed/`. Logs:
 `journalctl --user -u scan-process -f`.
 
+**Raw scans are kept for a while.** The finished PDFs in `~/Notes/Scans` are the result; nothing
+else is needed to keep your documents. As a safety net, the untouched scanner images of the last
+three scans stay in `~/.local/state/scan-queue/done/<timestamp>/` (roughly 60 MB per scan, more for
+big batches). If a PDF comes out badly cropped, split wrong or upside down, redo it without feeding
+the paper again: `scan-to-pdf --from-dir ~/.local/state/scan-queue/done/<timestamp>`. Each new scan
+pushes the oldest one out. Keep more or fewer with `SCAN_KEEP_RAW=N` in `~/.config/scan-button.env`;
+`SCAN_KEEP_RAW=0` deletes the raw images as soon as the PDFs are saved, and a bad result then means
+rescanning.
+
 **Watchdog:** SANE's software crop/deskew once spun forever on one card side (100% CPU, no I/O). If no
 new side arrives for 60 s (`SCAN_HANG_SECS`), scanimage is stopped, the sides already scanned are
 queued, and a notification tells you which sheet to rescan.
