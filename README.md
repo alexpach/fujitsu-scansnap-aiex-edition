@@ -1,6 +1,6 @@
 # Fujitsu ScanSnap - AIex Edition
 
-Press the Scan button on a Fujitsu ScanSnap iX500 under Linux and get named, searchable PDFs in a folder. No vendor software, no cloud: everything runs locally with SANE, ImageMagick and Tesseract.
+Press the Scan button on a Fujitsu ScanSnap iX500 under Linux or macOS and get named, searchable PDFs in a folder. No vendor software, no cloud: everything runs locally with SANE, ImageMagick and Tesseract.
 
 What a button press does:
 
@@ -27,7 +27,28 @@ Nothing runs while the scanner is off: a udev rule starts the button watcher whe
 
 PDFs go to `~/Notes/Scans`; set `SCAN_OUTDIR` in `~/.config/scan-button.env` to change that. More settings are listed under "How it works".
 
-Tested on one machine with one scanner. The naming and splitting rules are heuristics tuned on English, US-style bills, statements and business cards; expect to adjust them.
+### macOS
+
+Works over USB on an Intel Mac (macOS 26) with the Evernote Edition; Apple Silicon is untested. See [MAC-SUPPORT.md](MAC-SUPPORT.md) for what has and hasn't been checked.
+
+```sh
+brew install sane-backends imagemagick tesseract poppler   # on Intel this compiles from source: hours
+./install.sh        # builds the button watcher, installs two launchd agents (no sudo)
+```
+
+- Needs Homebrew and the Xcode command line tools (for `cc` and `/usr/bin/python3`). No Fujitsu software; if ScanSnap Home is installed, quit it.
+- The button watcher runs all the time and waits quietly while the scanner is off.
+- Logs: `~/Library/Logs/scan-button.log` and `~/Library/Logs/scan-process.log`.
+- Notifications: with `terminal-notifier` installed, clicking one opens the PDF; without it they are plain. (On Intel, Homebrew can only build `terminal-notifier` with the full Xcode app.)
+- Other OCR languages: `brew install tesseract-lang`.
+- To release the scanner for another app or for cleaning: `launchctl bootout gui/$(id -u)/com.aiex.scan-button`. Run `./install.sh` again to bring it back.
+- Uninstall: `bootout` both `com.aiex.scan-button` and `com.aiex.scan-process` as above, then delete their plists from `~/Library/LaunchAgents`.
+
+Wi-Fi scanning is not supported; [WIFI-SUPPORT-PLAN.md](WIFI-SUPPORT-PLAN.md) has the idea.
+
+The rest of this file describes the Linux setup unless it says otherwise.
+
+Tested on one Linux machine and one Mac with one scanner. The naming and splitting rules are heuristics tuned on English, US-style bills, statements and business cards; expect to adjust them.
 
 The rest of this file is the working notes: how the scanner was set up, how each step works, what was tried and what is still open. Fujitsu's manuals are not included; `docs/README.md` links to them and summarises what is known about the Evernote Edition.
 

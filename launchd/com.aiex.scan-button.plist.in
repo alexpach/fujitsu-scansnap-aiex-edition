@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template: install.sh fills in @HOME@ and @PREFIX@ (the Homebrew prefix) and writes the
+     result to ~/Library/LaunchAgents. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.aiex.scan-button</string>
+	<!-- ScanSnap scan button -> PDF. Always running; -w makes the watcher wait while the
+	     scanner is off (lid closed) instead of exiting. -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>@HOME@/.local/bin/scan-button-watch</string>
+		<string>-w</string>
+		<string>-i</string>
+		<string>1000</string>
+		<string>--</string>
+		<string>@HOME@/.local/bin/scan-to-pdf</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<!-- launchd's default PATH has no Homebrew in it -->
+		<key>PATH</key>
+		<string>@PREFIX@/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>@HOME@/Library/Logs/scan-button.log</string>
+	<key>StandardErrorPath</key>
+	<string>@HOME@/Library/Logs/scan-button.log</string>
+</dict>
+</plist>

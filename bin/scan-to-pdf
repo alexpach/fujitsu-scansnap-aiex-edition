@@ -10,13 +10,17 @@ Pipeline (per scan):
     a fully blank sheet works as a manual separator
  6. join pages (pdfunite), name from contents, save, notify (click to open)
 
-Settings come from the environment (see README / ~/.config/scan-button.env).
+Settings come from the environment and from ~/.config/scan-button.env (see README); the
+environment wins.
 Usage:
   scan-to-pdf                       scan into the queue, start the worker, return (what the button runs)
-  scan-to-pdf --worker              process queued scans, oldest first (scan-process.service)
+  scan-to-pdf --worker              process queued scans, oldest first (scan-process.service on
+                                    Linux, the com.aiex.scan-process agent on macOS)
   scan-to-pdf --from-dir DIR        process existing p0001.tif/jpg… files directly (testing)
   scan-to-pdf --dry-run --from-dir DIR   only print orientation/split decisions and names
 """
+from __future__ import annotations   # `Path | None` in annotations on Python 3.9 (macOS system Python)
+
 import datetime as dt
 import os
 import re
@@ -27,6 +31,53 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+
+MAC = sys.platform == "darwin"
+
+
+def load_settings(path: Path):
+    """Read KEY=value lines from the settings file into the environment.
+
+    The file is in systemd EnvironmentFile syntax, because on Linux the units read it too: one
+    assignment per line, `#` or `;` comment lines, optional single or double quotes around the
+    value, backslash escapes outside single quotes. Values already in the environment win.
+    """
+    try:
+        text = path.read_text()
+    except OSError:
+        return
+    for line in text.replace("\\\n", "").splitlines():
+        line = line.strip()
+        if not line or line[0] in "#;" or "=" not in line:
+            continue
+        key, raw = line.split("=", 1)
+        key, raw = key.strip(), raw.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        value, quote, i = "", None, 0
+        while i < len(raw):
+            c = raw[i]
+            if quote:
+                if c == quote:
+                    quote = None
+                elif c == "\\" and quote == '"' and i + 1 < len(raw):
+                    i += 1
+                    value += raw[i]
+                else:
+                    value += c
+            elif c in "'\"":
+                quote = c
+            elif c == "\\" and i + 1 < len(raw):
+                i += 1
+                value += raw[i]
+            else:
+                value += c
+            i += 1
+        os.environ.setdefault(key, value)
+
+
+# Before anything below reads a setting.
+load_settings(Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "scan-button.env")
 
 os.environ["PATH"] = f"{Path.home()}/.local/bin:" + os.environ.get("PATH", "/usr/bin")
 os.environ["OMP_THREAD_LIMIT"] = "1"   # one thread per tesseract; we run pages in parallel
@@ -63,6 +114,8 @@ def pmap(fn, items):
 
 def notify(summary, body="", urgency="normal", open_path=None):
     log(summary, body)
+    if MAC:
+        return notify_mac(summary, body, open_path)
     if not shutil.which("notify-send"):
         return
     args = ["-a", "Scanner", "-u", urgency, summary, body]
@@ -76,6 +129,42 @@ def notify(summary, body="", urgency="normal", open_path=None):
                          start_new_session=True)
     else:
         subprocess.run(["notify-send", *args], check=False)
+
+
+def notify_mac(summary, body, open_path):
+    """terminal-notifier if installed (click opens the file), else a plain osascript notification.
+    macOS has no "critical" urgency."""
+    if shutil.which("terminal-notifier"):
+        # It parses a message that starts with one of these as something else unless escaped.
+        esc = lambda s: "\\" + s if s[:1] in ("-", "[", "(", "<") else s
+        cmd = ["terminal-notifier", "-title", "Scanner", "-group", "scan-to-pdf"]
+        cmd += ["-subtitle", esc(summary), "-message", esc(body)] if body else ["-message", esc(summary)]
+        if open_path:
+            cmd += ["-open", Path(open_path).resolve().as_uri()]   # -open takes a URL
+    else:
+        script = ('on run argv', 'display notification (item 2 of argv) with title "Scanner" subtitle (item 1 of argv)',
+                  'end run') if body else ('on run argv', 'display notification (item 1 of argv) with title "Scanner"', 'end run')
+        cmd = ["osascript", *(x for line in script for x in ("-e", line)), summary, body]
+    try:
+        # stdin closed: terminal-notifier reads the message from a stdin that isn't a terminal
+        subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def missing_tools(*tools):
+    """Complain about tools that aren't installed. True if any is missing."""
+    missing = [t for t in tools if not shutil.which(t)]
+    if missing:
+        hint = ("brew install sane-backends imagemagick tesseract poppler" if MAC
+                else "install sane, imagemagick, tesseract and poppler")
+        notify("Scanner: missing tools", f"Not found: {', '.join(missing)}\n({hint})", urgency="critical")
+    return bool(missing)
+
+
+SCAN_TOOLS = ("scanimage",)
+PROCESS_TOOLS = ("magick", "tesseract", "pdftotext", "pdfunite")
 
 
 # ---------------------------------------------------------------- scanning
@@ -909,8 +998,15 @@ def pending():
 
 
 def start_worker():
-    r = run(["systemctl", "--user", "start", "--no-block", "scan-process.service"])
-    if r.returncode != 0:   # service not installed: run a detached worker instead
+    if MAC:
+        cmd = ["launchctl", "kickstart", f"gui/{os.getuid()}/com.aiex.scan-process"]
+    else:
+        cmd = ["systemctl", "--user", "start", "--no-block", "scan-process.service"]
+    try:
+        started = run(cmd).returncode == 0
+    except OSError:         # no systemctl / launchctl at all
+        started = False
+    if not started:         # service not installed: run a detached worker instead
         subprocess.Popen([sys.executable, os.path.abspath(__file__), "--worker"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
@@ -984,13 +1080,20 @@ def main(argv):
     dry = "--dry-run" in argv
     argv = [a for a in argv if a != "--dry-run"]
     if argv[:1] == ["--from-dir"] and len(argv) == 2:
+        if missing_tools(*PROCESS_TOOLS):
+            return 69
         process(Path(argv[1]), dt.datetime.now(), dry=dry)
         return 0
     if argv == ["--worker"]:
+        # Checked before touching the queue: otherwise every queued scan would end up in failed/.
+        if missing_tools(*PROCESS_TOOLS):
+            return 69
         return worker()
     if argv:
         print(__doc__, file=sys.stderr)
         return 64
+    if missing_tools(*SCAN_TOOLS):
+        return 69
     return scan_to_queue()
 
 

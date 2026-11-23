@@ -9,8 +9,10 @@
  * While the command runs, the SANE handle is closed so the command can use the
  * scanner, then reopened.
  *
- * Usage: scan-button-watch [-d device] [-i interval_ms] -- command [args...]
- * Exits non-zero if the scanner goes away (systemd stops/restarts us).
+ * Usage: scan-button-watch [-w] [-d device] [-i interval_ms] -- command [args...]
+ * Exits non-zero if the scanner goes away (Linux: systemd stops/restarts us).
+ * With -w it never exits for that; it waits for the scanner to come back (macOS: launchd
+ * keeps one watcher running whether the scanner is on or not).
  *
  * Build: cc -O2 -Wall -o scan-button-watch scan-button-watch.c -lsane
  */
@@ -48,6 +50,29 @@ static SANE_Status open_scanner(const char *dev, SANE_Handle *h, SANE_Int *opt) 
     return SANE_STATUS_UNSUPPORTED;
 }
 
+/*
+ * -w: wait until the scanner can be opened. Call with SANE shut down; returns 0 with SANE
+ * initialised and the scanner open, or -1 when told to stop (SANE shut down).
+ *
+ * SANE is restarted for every attempt so the backend looks at USB afresh: a scanner that is
+ * switched back on has a new USB address. Nothing is logged per attempt.
+ */
+#define WAIT_MS 5000
+static int wait_for_scanner(const char *dev, SANE_Handle *h, SANE_Int *opt) {
+    printf("waiting for the scanner\n");
+    for (;;) {
+        sleep_ms(WAIT_MS);
+        if (stop) return -1;
+        SANE_Int version;
+        if (sane_init(&version, NULL) != SANE_STATUS_GOOD) continue;
+        if (open_scanner(dev, h, opt) == SANE_STATUS_GOOD) {
+            printf("scanner found\n");
+            return 0;
+        }
+        sane_exit();
+    }
+}
+
 static int run(char **argv) {
     pid_t pid = fork();
     if (pid < 0) { perror("fork"); return -1; }
@@ -64,9 +89,11 @@ static int run(char **argv) {
 int main(int argc, char **argv) {
     const char *dev = "fujitsu";
     long interval = 1000;
+    int wait_mode = 0;
     int c;
-    while ((c = getopt(argc, argv, "d:i:")) != -1) {
+    while ((c = getopt(argc, argv, "wd:i:")) != -1) {
         switch (c) {
+        case 'w': wait_mode = 1; break;
         case 'd': dev = optarg; break;
         case 'i': interval = strtol(optarg, NULL, 10); break;
         default: goto usage;
@@ -91,7 +118,8 @@ int main(int argc, char **argv) {
     if (st != SANE_STATUS_GOOD) {
         fprintf(stderr, "cannot open '%s': %s\n", dev, sane_strstatus(st));
         sane_exit();
-        return 2;
+        if (!wait_mode) return 2;
+        if (wait_for_scanner(dev, &h, &opt) != 0) return 0;
     }
     printf("watching scan button on '%s' every %ld ms\n", dev, interval);
 
@@ -102,7 +130,14 @@ int main(int argc, char **argv) {
         if (st != SANE_STATUS_GOOD) {
             /* Transient errors happen (e.g. waking from power save); give up after a few. */
             fprintf(stderr, "reading button failed: %s\n", sane_strstatus(st));
-            if (++failures >= 5) { rc = 3; break; }
+            if (++failures >= 5) {
+                if (!wait_mode) { rc = 3; break; }
+                sane_close(h);
+                sane_exit();
+                if (wait_for_scanner(dev, &h, &opt) != 0) return 0;
+                failures = 0;
+                continue;
+            }
             sleep_ms(2000);
             continue;
         }
@@ -119,7 +154,8 @@ int main(int argc, char **argv) {
             if (st != SANE_STATUS_GOOD) {
                 fprintf(stderr, "cannot reopen '%s': %s\n", dev, sane_strstatus(st));
                 sane_exit();
-                return 2;
+                if (!wait_mode) return 2;
+                if (wait_for_scanner(dev, &h, &opt) != 0) return 0;
             }
             continue;
         }
@@ -131,6 +167,6 @@ int main(int argc, char **argv) {
     return rc;
 
 usage:
-    fprintf(stderr, "usage: %s [-d device] [-i interval_ms] -- command [args...]\n", argv[0]);
+    fprintf(stderr, "usage: %s [-w] [-d device] [-i interval_ms] -- command [args...]\n", argv[0]);
     return 64;
 }
