@@ -16,6 +16,8 @@ Done and checked on that Mac:
   were moved to `done/` and the worker exited 0.
 - A button press with no paper reports "Scan failed: no pages" and the watcher carries on.
 - Lid closed and reopened: the watcher finds the scanner again (reported by the user).
+- The new wait-and-restart path, by holding the scanner with a second process and releasing it.
+  It has not yet been through a real lid close and reopen.
 - The plain `osascript` notifications appear (reported by the user).
 
 Not done yet:
@@ -125,10 +127,13 @@ With `-w`, all three exits become "go back to waiting":
 - the scanner can't be reopened after a scan.
 
 While waiting: retry every few seconds, log once when the scanner goes away and once when it comes
-back, not on every attempt. Call `sane_exit()` and `sane_init()` between attempts, so the backend
-looks at USB afresh. (The fujitsu backend appears to keep its device list once it has one, and a
-scanner that is switched back on gets a new USB address. Believed from memory of the backend, not
-checked against its source; the reinit is cheap either way.)
+back, not on every attempt.
+
+Each attempt is a new process, and when one succeeds the watcher replaces itself with a fresh
+copy. The first version stayed in one process and called `sane_exit()` and `sane_init()` between
+attempts. That worked twice and then got stuck on 2026-11-25: the scanner was back on USB and
+`scanimage -L` in a terminal found it, but the watcher kept waiting until it was restarted. Why
+SANE could no longer open the scanner in that process was not found.
 
 Build: `cc -O2 -Wall -Wextra -I"$prefix/include" -L"$prefix/lib" -o … -lsane` with
 `prefix=$(brew --prefix)`.
