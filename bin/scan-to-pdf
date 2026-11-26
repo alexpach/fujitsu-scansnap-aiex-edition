@@ -248,6 +248,10 @@ class Side:
     def blank(self):
         return self.dark < BLANK_PCT
 
+    @property
+    def is_dark(self):
+        return self.dark > 50
+
 
 @dataclass
 class Sheet:
@@ -392,9 +396,14 @@ def osd(img: Path):
     return (int(rot.group(1)) if rot else 0), (float(conf.group(1)) if conf else 0.0)
 
 
-def read_score(img: Path, rotate: int):
+# Dark sides (light print on black or a dark color) are often low in contrast: gold on black,
+# gray on navy. Tesseract copes with the inversion itself, but not with the low contrast.
+DARK_PREP = "-colorspace Gray -clahe 12.5x12.5%+128+3 -negate"
+
+
+def read_score(img: Path, rotate: int, dark=False):
     """How well the image reads at a rotation: confident, word-like OCR tokens."""
-    p = subprocess.run(f'magick "{img}" -rotate {rotate} -colorspace Gray png:- | '
+    p = subprocess.run(f'magick "{img}" -rotate {rotate} {DARK_PREP if dark else "-colorspace Gray"} png:- | '
                        f'tesseract - - --psm 11 --dpi {RES} tsv',
                        shell=True, capture_output=True, text=True)
     score = 0.0
@@ -413,6 +422,9 @@ def orient(item):
     if card:
         # Cards: little text, OSD is unreliable -> try all four orientations.
         scores = {rot: read_score(side.src, rot) for rot in (0, 90, 180, 270)}
+        if side.is_dark:
+            # The raised contrast reads some dark sides far better and others worse: take the best.
+            scores = {rot: max(sc, read_score(side.src, rot, dark=True)) for rot, sc in scores.items()}
         side.rotate = max(scores, key=scores.get)
         side.osd_conf = scores[side.rotate]
         return
@@ -500,6 +512,14 @@ def render(side: Side):
         r = run(["tesseract", str(side.jpg), "-", "-l", OCR_LANG, "--dpi", str(RES * upscale), "--psm", "6"])
         if card_fields(r.stdout)[0]:
             side.text = r.stdout + "\n" + side.text
+    if side.is_dark:
+        # Low-contrast print on a dark side: read it again with the contrast raised and keep the
+        # fuller text (for the name and the front/back choice; the PDF keeps the first text layer).
+        r = subprocess.run(f'magick "{side.jpg}" {DARK_PREP} png:- | '
+                           f'tesseract - - -l {OCR_LANG} --dpi {RES * upscale}',
+                           shell=True, capture_output=True, text=True)
+        if len(re.findall(r"\w", r.stdout)) > 1.2 * len(re.findall(r"\w", side.text)):
+            side.text = r.stdout
 
 
 def distance(a: Side, b: Side):
