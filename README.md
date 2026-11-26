@@ -2,6 +2,12 @@
 
 Press the Scan button on a Fujitsu ScanSnap iX500 under Linux and get named, searchable PDFs in a folder. No vendor software, no cloud: everything runs locally with SANE, ImageMagick and Tesseract.
 
+![Sample output: a letter, a brochure, a receipt and two business cards, each saved as a named PDF](docs/sample-scans.jpg)
+
+*Sample output. The documents shown are made up (no real people or companies); the pages and file names are what the script produced from them.*
+
+**macOS:** this branch is Linux only. A macOS version (Homebrew and launchd, over USB) is on the [`mac-support`](https://github.com/alexpach/fujitsu-scansnap-aiex-edition/tree/mac-support) branch. It works on an Intel Mac, is untested on Apple Silicon, and will be merged here once it has been checked on Linux. See `MAC-SUPPORT.md` on that branch.
+
 What a button press does:
 
 - scans the stack (duplex, 300 dpi color) and queues it, so you can scan the next stack right away
