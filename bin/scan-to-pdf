@@ -403,7 +403,7 @@ def read_score(img: Path, rotate: int):
         if len(cols) < 12:
             continue
         conf, word = float(cols[10]), cols[11]
-        if conf > 60 and len(word) >= 3 and re.fullmatch(r"[A-Za-z][A-Za-z'-]+[a-z]", word):
+        if conf > 60 and len(word) >= 3 and re.fullmatch(r"[A-Za-z][A-Za-z'-]+[A-Za-z]", word):
             score += len(word) * conf / 100
     return score
 
