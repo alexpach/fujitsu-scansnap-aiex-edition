@@ -7,6 +7,7 @@ What a button press does:
 - scans the stack (duplex, 300 dpi color) and queues it, so you can scan the next stack right away
 - crops and straightens each sheet, drops blank sides, turns pages the right way up
 - splits a stack into separate documents and saves each business card as its own file
+- puts the front of a business card first: the side with the contact details, or the English side of a two-language card
 - OCRs everything and names the files from their content (`2026-09-17 Acme Health statement.pdf`, `Business card - Jane Doe (Acme).pdf`)
 - never overwrites a file; rescans of the same paper go to `duplicates/`
 - shows a notification you can click to open the result

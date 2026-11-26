@@ -6,7 +6,8 @@ Pipeline (per scan):
  2. per side: size + blank test (inner area only, so edge shadows don't count)
  3. per side: orientation (tesseract OSD; brute force for cards / low confidence)
  4. per side: rotate, JPEG, tesseract -> one-page PDF with text layer + text
- 5. split into documents at sheet boundaries (see split_documents), cards one per file,
+ 5. split into documents at sheet boundaries (see split_documents), cards one per file (front side
+    first, see fix_card_side_order),
     a fully blank sheet works as a manual separator
  6. join pages (pdfunite), name from contents, save, notify (click to open)
 
@@ -791,6 +792,57 @@ def card_fields(text):
     return person, company
 
 
+EMAIL = re.compile(r"[\w.+-]+ ?@ ?[\w-]+(?:\.[\w-]+)+")
+PHONE = re.compile(r"\+?\(?\d[\d ().\-]{7,}\d")
+WEB = re.compile(r"(?i)\b(?:www\.|https?:)|\b[\w-]+\.(?:com|org|net|io|ch|de|co)\b")
+# Words that show a card side is in English (labels, address words, titles are added below).
+ENGLISH = re.compile(
+    r"(?i)\b(tel|telephone|phone|mobile|cell|fax|email|e-mail|office|direct|street|st|suite|road|rd|avenue|ave|"
+    r"drive|dr|building|floor|box|the|and|of|for|inc|ltd|llc|corp|corporation|company|business|"
+    r"development|technology|solutions|security|management|division|operations|global)\b")
+
+
+def card_side_score(text):
+    """(contact, english) scores for how much a card side looks like the front.
+
+    The front is the side with the contact details: email, phone, a person's name, a job title.
+    A logo or slogan side scores near zero. When both sides carry the details (the back repeats
+    them in another language), the English side scores higher: it has English labels and
+    titles, and it reads as clean words. Another script read with the English OCR model comes
+    out as short fragments.
+    """
+    tokens = [t for t in re.split(r"[\s|]+", text) if re.search(r"[^\W\d_]", t)]
+    clean = [t for t in tokens if re.fullmatch(r"[A-Za-z][A-Za-z'’.,&-]{2,}", t)
+             and (t[1:].islower() or t.isupper())]
+    info = (3 * bool(EMAIL.search(text)) + 2 * min(2, len(PHONE.findall(text)))
+            + 2 * bool(card_fields(text)[0]) + bool(WEB.search(text)))
+    english_words = len(set(m.lower() for m in ENGLISH.findall(text))
+                        | set(m.lower() for m in TITLE_WORDS.findall(text)))
+    foreign = len(re.findall(r"[^\x00-\x7f©®™’‘“”–—•·°|]", text))
+    readable = len(clean) / len(tokens) if len(tokens) >= 4 else 0.0
+    english = min(4.0, 0.7 * english_words + 2 * readable - 0.2 * foreign)
+    return info, english
+
+
+def card_back_first(first, second):
+    """True if the second of two card sides (OCR text) is the front."""
+    (ci, ce), (di, de) = card_side_score(first), card_side_score(second)
+    if min(ci, di) >= 6:                 # contact details on both sides: two languages
+        return de > ce + 1
+    return di + de > ci + ce + 1.5
+
+
+def fix_card_side_order(sheet: Sheet):
+    """Business cards fed back side first: put the front (contact details; the English side of a
+    two-language card) first. The feed order stays unless the other side is clearly ahead."""
+    if not sheet.card or len(sheet.sides) != 2 or len(sheet.content) != 2:
+        return False
+    if card_back_first(*(s.text for s in sheet.sides)):
+        sheet.sides.reverse()
+        return True
+    return False
+
+
 def safe(s, maxlen=80):
     s = re.sub(r"[/\\:*?\"<>|\x00-\x1f]", "", s)
     return re.sub(r"\s+", " ", s).strip()[:maxlen].strip()
@@ -931,6 +983,8 @@ def process(src_dir: Path, scanned_at, problem=None, dry=False):
         for i, sh in enumerate(sheets, 1):
             if fix_side_order(sh) and dry:
                 log(f"sheet {i}: sides swapped (fed back side first)")
+            if fix_card_side_order(sh) and dry:
+                log(f"sheet {i}: card sides swapped (front is the side with the contact details / in English)")
         if dry:
             for i, sh in enumerate(sheets, 1):
                 log(f"sheet {i}: " + ", ".join(
