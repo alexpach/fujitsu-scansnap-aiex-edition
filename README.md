@@ -2,6 +2,10 @@
 
 Press the Scan button on a Fujitsu ScanSnap iX500 under Linux or macOS and get named, searchable PDFs in a folder. No vendor software, no cloud: everything runs locally with SANE, ImageMagick and Tesseract.
 
+![Sample output: a letter, a brochure, a receipt and two business cards, each saved as a named PDF](docs/sample-scans.jpg)
+
+*Sample output. The documents shown are made up (no real people or companies); the pages and file names are what the script produced from them.*
+
 What a button press does:
 
 - scans the stack (duplex, 300 dpi color) and queues it, so you can scan the next stack right away
@@ -170,7 +174,7 @@ Steps:
 2. **Blank sides are dropped.** The test only looks at the inner ~88% × 84% of each side. Real blank card/paper backs measure 0% dark pixels there, but 1–2% on the whole side because of edge shadows (`SCAN_BLANK_PCT`, default 0.05).
 3. **Orientation**, per side:
    - documents: tesseract orientation detection at full resolution. If it's unsure (confidence < 2), the script compares how well the page reads upright vs upside down. A confident side of a sheet decides for an unsure one. ocrmypdf's default threshold (14) missed real upside-down pages, which scored 6–14.
-   - cards: try all four rotations and keep the one that reads best. Card backs without text (logo, QR) follow the front.
+   - cards: try all four rotations and keep the one that reads best. Card backs without text (logo, QR) follow the front. Sides that are mostly dark (light print on black) are also tried with the local contrast raised, and the better reading wins.
    - cards are then **leveled from their text lines** (`magick -deskew`, applied only for tilts of 0.2–10°), and the exposed corners are filled with the backing color and trimmed. SANE's `--swdeskew` leaves cards 1–3° off: the iX500's backing plate is light gray (~215–235/255), so a white card's edges barely show. That low contrast also makes `--swcrop` occasionally cut into a white card (one card lost the top of its name). Cards are saved at JPEG q92 (`SCAN_CARD_JPEG_QUALITY`).
 4. **OCR** per side with tesseract (one thread each, all sides in parallel), giving a one-page PDF with a text layer. Cards are OCR'd at 2× for small print, with a "single block" fallback when no name is found.
 5. **Split into documents** (only at sheet boundaries; a document never starts on a back side):
